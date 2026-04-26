@@ -5,6 +5,7 @@ matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
 import networkx as nx
+from matplotlib import font_manager
 
 
 def build_agv_topology():
@@ -255,9 +256,32 @@ def build_agv_topology():
     return graph, main_roads
 
 
+def configure_plot_font():
+    """Use a CJK font when available, otherwise fall back to an English title."""
+    preferred_fonts = [
+        "Noto Sans CJK SC",
+        "Noto Sans CJK JP",
+        "Source Han Sans SC",
+        "WenQuanYi Zen Hei",
+        "SimHei",
+        "Microsoft YaHei",
+        "PingFang SC",
+    ]
+    available_fonts = {font.name for font in font_manager.fontManager.ttflist}
+
+    for font_name in preferred_fonts:
+        if font_name in available_fonts:
+            plt.rcParams["font.sans-serif"] = [font_name, "DejaVu Sans"]
+            plt.rcParams["axes.unicode_minus"] = False
+            return "AGV 完整路径拓扑图"
+
+    return "AGV Complete Path Topology"
+
+
 def draw_agv_topology(graph, main_roads, output_path="agv_complete_topology.png"):
     """Draw the graph and save the figure to disk."""
     pos = nx.get_node_attributes(graph, "pos")
+    title = configure_plot_font()
     plt.figure(figsize=(20, 16))
 
     nx.draw_networkx_edges(graph, pos, edge_color="lightgray", width=0.5, alpha=0.6)
@@ -271,9 +295,16 @@ def draw_agv_topology(graph, main_roads, output_path="agv_complete_topology.png"
 
     key_nodes = ["N1", "N2", "N3", "N5", "N6", "N7", "N8", "N9", "N10"]
     key_pos = {k: pos[k] for k in key_nodes if k in pos}
-    nx.draw_networkx_labels(graph, key_pos, font_size=8, font_weight="bold")
+    key_labels = {k: k for k in key_pos}
+    nx.draw_networkx_labels(
+        graph,
+        key_pos,
+        labels=key_labels,
+        font_size=8,
+        font_weight="bold",
+    )
 
-    plt.title("AGV 完整路径拓扑图", fontsize=14)
+    plt.title(title, fontsize=14)
     plt.axis("equal")
     plt.grid(True, linestyle=":", alpha=0.3)
     plt.tight_layout()
