@@ -16,3 +16,17 @@ Run the validation with:
 ```bash
 python3 test_small_scenario.py
 ```
+
+Run the genetic algorithm baseline comparison with:
+
+```bash
+python3 run_genetic_algorithm.py
+```
+
+This script prints:
+
+- a random baseline solution
+- the best genetic algorithm solution
+- task assignment by AGV
+- per-AGV schedule summary
+- convergence history
