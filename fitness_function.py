@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict
+from typing import Mapping
 
-from .models import DecodedSolution, Evaluation, Instance
+from models import DecodedSolution, Evaluation, Instance
 
 
 @dataclass(frozen=True)
@@ -31,18 +31,19 @@ def compute_battery_penalty(instance: Instance, decoded: DecodedSolution) -> flo
     penalty = 0.0
     for agv_id, schedule in decoded.agv_schedules.items():
         agv = instance.agvs[agv_id]
-        min_battery = min((record.battery for record in schedule.battery_trace), default=agv.battery_init)
+        min_battery = min(
+            (record.battery for record in schedule.battery_trace),
+            default=agv.battery_init,
+        )
         penalty += max(0.0, agv.battery_min - min_battery)
     return penalty
 
 
 def compute_capacity_penalty(decoded: DecodedSolution) -> float:
-    # Capacity conflicts are resolved by waiting in the decoder, so violations
-    # should be zero in the deterministic Day 1 pipeline.
     return 0.0
 
 
-def compute_load_penalty(instance: Instance, solution: Dict[str, object]) -> float:
+def compute_load_penalty(instance: Instance, solution: Mapping[str, object]) -> float:
     assignment = solution.get("assignment", {})
     penalty = 0.0
     if isinstance(assignment, dict):
@@ -54,18 +55,29 @@ def compute_load_penalty(instance: Instance, solution: Dict[str, object]) -> flo
 
 
 def evaluate_solution(
-    solution: Dict[str, object],
+    solution: Mapping[str, object],
     instance: Instance,
     decoded: DecodedSolution,
     weights: FitnessWeights | None = None,
 ) -> Evaluation:
     weights = weights or FitnessWeights()
 
-    makespan = max((schedule.final_time for schedule in decoded.agv_schedules.values()), default=0.0)
-    total_distance = sum(schedule.total_distance for schedule in decoded.agv_schedules.values())
-    total_energy = sum(schedule.total_energy for schedule in decoded.agv_schedules.values())
-    congestion_wait = sum(schedule.total_wait for schedule in decoded.agv_schedules.values())
-    charge_count = sum(len(schedule.charging_events) for schedule in decoded.agv_schedules.values())
+    makespan = max(
+        (schedule.final_time for schedule in decoded.agv_schedules.values()),
+        default=0.0,
+    )
+    total_distance = sum(
+        schedule.total_distance for schedule in decoded.agv_schedules.values()
+    )
+    total_energy = sum(
+        schedule.total_energy for schedule in decoded.agv_schedules.values()
+    )
+    congestion_wait = sum(
+        schedule.total_wait for schedule in decoded.agv_schedules.values()
+    )
+    charge_count = sum(
+        len(schedule.charging_events) for schedule in decoded.agv_schedules.values()
+    )
 
     late_penalty, late_task_count = compute_late_penalty(decoded)
     battery_penalty = compute_battery_penalty(instance, decoded)

@@ -84,7 +84,7 @@ class AGV:
 class Instance:
     global_params: GlobalParams
     nodes: Dict[str, Node]
-    edges: List[Edge]
+    edges: Dict[Tuple[str, str], Edge]
     tasks: Dict[str, Task]
     agvs: Dict[str, AGV]
     graph: nx.DiGraph

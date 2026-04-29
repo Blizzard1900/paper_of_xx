@@ -4,7 +4,7 @@ from typing import Dict, Iterable, Tuple
 
 import networkx as nx
 
-from .models import AGV, Edge, GlobalParams, Instance, Node, Task
+from models import AGV, Edge, GlobalParams, Instance, Node, Task
 
 
 def build_global_params() -> GlobalParams:
@@ -57,7 +57,6 @@ def load_nodes(params: GlobalParams | None = None) -> Dict[str, Node]:
     _ = params or build_global_params()
     nodes: Dict[str, Node] = {}
 
-    # Road and boundary junctions.
     _add_node(nodes, "J1", "junction", "road", -5.0, 32.0)
     _add_node(nodes, "J2", "junction", "road", -60.0, 32.0)
     _add_node(nodes, "J3", "junction", "road", -5.0, 12.0)
@@ -69,20 +68,17 @@ def load_nodes(params: GlobalParams | None = None) -> Dict[str, Node]:
     _add_node(nodes, "J9", "junction", "road", 2.5, -0.3)
     _add_node(nodes, "J10", "junction", "road", 2.5, -31.8)
 
-    # Production service nodes.
     _generate_linear_nodes(nodes, "L1", -34.0, 32.5, -2.0, 13, "line1", "production")
     _generate_linear_nodes(nodes, "L2", -17.0, 31.0, -3.0, 5, "line2", "production")
     _generate_linear_nodes(nodes, "L3", -33.0, 31.0, -8.0, 3, "line3", "production")
     _generate_linear_nodes(nodes, "L4", -20.0, 0.0, -2.0, 9, "line4", "production")
 
-    # Buffers and stock points.
     _add_node(nodes, "A", "buffer", "buffer", 32.5, -60.0, service_capable=True)
     _add_node(nodes, "B", "buffer", "buffer", 30.5, -27.0, service_capable=True)
     _add_node(nodes, "C", "buffer", "buffer", 31.0, -33.0, service_capable=True)
     _add_node(nodes, "Bf", "buffer", "buffer", -36.0, 0.0, service_capable=True)
     _add_node(nodes, "Df", "buffer", "buffer", -39.0, 0.0, service_capable=True)
 
-    # Chargers.
     for index in range(1, 11):
         _add_node(
             nodes,
@@ -93,13 +89,11 @@ def load_nodes(params: GlobalParams | None = None) -> Dict[str, Node]:
             43.5,
         )
 
-    # Three lanes.
     for index in range(1, 4):
         lane_x = 1.0 + 0.5 * (index - 1)
         _add_node(nodes, f"LANE_{index}_TOP", "lane", "lane", lane_x, 34.0)
         _add_node(nodes, f"LANE_{index}_BOTTOM", "lane", "lane", lane_x, -31.8)
 
-    # Storage area.
     for row in range(1, 11):
         for col in range(1, 13):
             _add_node(
@@ -112,7 +106,6 @@ def load_nodes(params: GlobalParams | None = None) -> Dict[str, Node]:
                 service_capable=True,
             )
 
-    # Finish area.
     for row in range(1, 10):
         for col in range(1, 13):
             _add_node(
@@ -125,7 +118,6 @@ def load_nodes(params: GlobalParams | None = None) -> Dict[str, Node]:
                 service_capable=True,
             )
 
-    # Defect area.
     for col in range(1, 13):
         _add_node(
             nodes,
@@ -239,7 +231,6 @@ def load_edges(
     params = params or build_global_params()
     edge_map: Dict[Tuple[str, str], Edge] = {}
 
-    # Main road 1 contains line 1 stations in order and provides the main production spine.
     _connect_chain(
         edge_map,
         nodes,
@@ -260,7 +251,6 @@ def load_edges(
         is_production_edge=True,
     )
 
-    # Service links.
     for node_id in [f"L2_{idx}" for idx in range(1, 6)]:
         _add_bidirectional_edge(edge_map, nodes, params, node_id, "J1", edge_type="service_link", is_production_edge=True)
     for node_id in [f"L3_{idx}" for idx in range(1, 4)]:
@@ -275,14 +265,12 @@ def load_edges(
     )
     _add_bidirectional_edge(edge_map, nodes, params, "L4_1", "J5", edge_type="service_link", is_production_edge=True)
 
-    # Buffer and stock links.
     _add_bidirectional_edge(edge_map, nodes, params, "A", "J10", edge_type="buffer_link")
     _add_bidirectional_edge(edge_map, nodes, params, "B", "J10", edge_type="buffer_link")
     _add_bidirectional_edge(edge_map, nodes, params, "C", "J10", edge_type="buffer_link")
     _add_bidirectional_edge(edge_map, nodes, params, "Bf", "J5", edge_type="buffer_link", is_production_edge=True)
     _add_bidirectional_edge(edge_map, nodes, params, "Df", "J6", edge_type="buffer_link", is_production_edge=True)
 
-    # Lanes.
     _add_bidirectional_edge(edge_map, nodes, params, "J4", "LANE_1_TOP", edge_type="lane_access")
     _add_bidirectional_edge(edge_map, nodes, params, "J10", "LANE_1_BOTTOM", edge_type="lane_access")
     for index in range(1, 4):
@@ -313,7 +301,6 @@ def load_edges(
             edge_type="lane_bottom_link",
         )
 
-    # Chargers.
     _connect_chain(
         edge_map,
         nodes,
@@ -324,7 +311,6 @@ def load_edges(
     _add_bidirectional_edge(edge_map, nodes, params, "C1", "J7", edge_type="charger_access")
     _add_bidirectional_edge(edge_map, nodes, params, "J7", "J4", edge_type="storage_to_road")
 
-    # Storage grid.
     for row in range(1, 11):
         _connect_chain(
             edge_map,
@@ -344,7 +330,6 @@ def load_edges(
     _add_bidirectional_edge(edge_map, nodes, params, "J8", "S_1_1", edge_type="storage_access")
     _add_bidirectional_edge(edge_map, nodes, params, "J7", "S_10_1", edge_type="storage_access")
 
-    # Finish and defect grids.
     for row in range(1, 10):
         _connect_chain(
             edge_map,

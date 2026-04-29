@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from pprint import pprint
 
-from agv_day1.data_loader import build_default_instance
-from agv_day1.fitness_function import evaluate_solution
-from agv_day1.scheduler_decoder import build_assignment_solution, decode_solution
+from data_loader import build_default_instance
+from fitness_function import evaluate_solution
+from scheduler_decoder import build_assignment_solution, decode_solution
 
 
 def build_manual_solution():

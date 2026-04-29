@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Dict, List, Mapping, Sequence, Tuple
 
-from .models import (
+from models import (
     AGV,
     AGVDecodedSchedule,
     BatteryRecord,
@@ -13,7 +13,7 @@ from .models import (
     Task,
     TaskExecution,
 )
-from .shortest_path import shortest_path_metrics
+from shortest_path import shortest_path_metrics
 
 
 def build_assignment_solution(
