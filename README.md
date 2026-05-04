@@ -8,10 +8,22 @@
 python3 ga_agv_scheduler.py --target-good 200 --agv-count 4 --population 30 --generations 40
 ```
 
-启动图形界面：
+启动 Web 图形界面：
 
 ```bash
 python3 ga_agv_scheduler.py --ui
+```
+
+启动后终端会显示访问地址，默认打开：
+
+```text
+http://127.0.0.1:8000
+```
+
+如果需要从外部访问，可指定监听地址：
+
+```bash
+python3 ga_agv_scheduler.py --ui --host 0.0.0.0 --port 8000
 ```
 
 常用参数：
