@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import math
 import os
+import queue
 import random
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from pprint import pprint
@@ -247,8 +249,11 @@ class InventorySimulationResult:
     average_inventory: float
     stop_by_line: Dict[str, float]
     qualified_output_total: float
+    qualified_storage_total: float
     defect_output_total: float
     capacity_penalty: float
+    target_reached: bool
+    target_reached_time: Optional[float]
 
 
 @dataclass
@@ -296,16 +301,16 @@ class ExperimentRunResult:
 
 @dataclass(frozen=True)
 class FitnessWeights:
-    makespan: float = 1.0
+    makespan: float = 10000.0
     total_distance: float = 1.0
-    total_energy: float = 60.0
-    congestion_wait: float = 10.0
-    line_stop_time: float = 200.0
-    late_penalty: float = 500.0
+    total_energy: float = 40.0
+    congestion_wait: float = 5.0
+    line_stop_time: float = 50.0
+    late_penalty: float = 50.0
     battery_penalty: float = 3000.0
     capacity_penalty: float = 3000.0
     load_penalty: float = 2000.0
-    inventory_holding: float = 0.1
+    inventory_holding: float = 0.05
 
 
 @dataclass(frozen=True)
@@ -1096,31 +1101,34 @@ class TaskGenerator:
                 reserved_levels[source_inventory_id] = source_available - qty
                 reserved_levels[inventory_id] = current_level + qty
 
-            if inventory.role == "line_end" and inventory.item_type in {"qualified", "defect"} and current_level >= inventory.reorder_point and inventory_id not in active_targets:
-                qty = min(inventory.replenish_qty, current_level)
-                destination_inventory_id = self._select_destination_bin(inventory.item_type, reserved_levels, qty)
-                if destination_inventory_id is None or qty <= 0:
-                    continue
-                deadline = current_time + self._time_to_full(inventory_id, current_level)
-                task_id = f"TASK_{task_index:03d}"
-                task_index += 1
+            if inventory.role == "line_end" and inventory.item_type in {"qualified", "defect"} and current_level > 0 and inventory_id not in active_targets:
+                remaining_level = current_level
                 task_type = "finished_putaway" if inventory.item_type == "qualified" else "defect_putaway"
-                tasks[task_id] = Task(
-                    task_id=task_id,
-                    task_type=task_type,
-                    pickup_node=inventory.node_id,
-                    drop_node=self.instance.inventory_bins[destination_inventory_id].node_id,
-                    qty=qty,
-                    earliest_start=current_time,
-                    latest_finish=deadline,
-                    pickup_service_time=self.instance.global_params.default_pick_service_time_s,
-                    drop_service_time=self.instance.global_params.default_drop_service_time_s,
-                    source_inventory_id=inventory_id,
-                    target_inventory_id=destination_inventory_id,
-                    generated_time=current_time,
-                )
-                reserved_levels[inventory_id] = current_level - qty
-                reserved_levels[destination_inventory_id] = reserved_levels.get(destination_inventory_id, 0.0) + qty
+                while remaining_level > 0:
+                    qty = min(inventory.replenish_qty, remaining_level)
+                    destination_inventory_id = self._select_destination_bin(inventory.item_type, reserved_levels, qty)
+                    if destination_inventory_id is None or qty <= 0:
+                        break
+                    deadline = current_time + self._time_to_full(inventory_id, remaining_level)
+                    task_id = f"TASK_{task_index:03d}"
+                    task_index += 1
+                    tasks[task_id] = Task(
+                        task_id=task_id,
+                        task_type=task_type,
+                        pickup_node=inventory.node_id,
+                        drop_node=self.instance.inventory_bins[destination_inventory_id].node_id,
+                        qty=qty,
+                        earliest_start=current_time,
+                        latest_finish=deadline,
+                        pickup_service_time=self.instance.global_params.default_pick_service_time_s,
+                        drop_service_time=self.instance.global_params.default_drop_service_time_s,
+                        source_inventory_id=inventory_id,
+                        target_inventory_id=destination_inventory_id,
+                        generated_time=current_time,
+                    )
+                    remaining_level -= qty
+                    reserved_levels[inventory_id] = remaining_level
+                    reserved_levels[destination_inventory_id] = reserved_levels.get(destination_inventory_id, 0.0) + qty
 
         return tasks
 
@@ -1136,11 +1144,11 @@ class TaskGenerator:
 def task_priority_score(task: Task) -> Tuple[float, float, float]:
     slack = max(1.0, task.latest_finish - task.earliest_start)
     task_type_bias = {
-        "semi_finished_transfer": 0.75,
-        "material_replenishment": 1.0,
-        "finished_putaway": 1.2,
-        "defect_putaway": 1.5,
-    }.get(task.task_type, 1.3)
+        "semi_finished_transfer": 0.55,
+        "material_replenishment": 0.75,
+        "finished_putaway": 1.6,
+        "defect_putaway": 2.0,
+    }.get(task.task_type, 1.5)
     return (slack / task_type_bias, task.earliest_start, task.latest_finish)
 
 
@@ -1526,6 +1534,8 @@ def simulate_inventory(
     capacity_penalty = 0.0
     tracked_inventory = [inventory_id for inventory_id, bin_info in instance.inventory_bins.items() if bin_info.role in {"station_input", "line_end"}]
     inventory_accumulator = 0.0
+    target_reached = False
+    target_reached_time: Optional[float] = None
 
     current_time = 0.0
     while current_time <= horizon + 1e-9:
@@ -1587,6 +1597,10 @@ def simulate_inventory(
             stop_by_line[line_id] += ratio * dt
 
         inventory_accumulator += sum(levels[inventory_id] for inventory_id in tracked_inventory)
+        qualified_storage_total = sum(
+            levels[inventory_id]
+            for inventory_id in instance.qualified_storage_bins
+        )
         snapshots.append(
             InventorySnapshot(
                 time=current_time,
@@ -1594,6 +1608,10 @@ def simulate_inventory(
                 line_stop_ratio=dict(line_stop_ratio),
             )
         )
+        if qualified_storage_total >= instance.global_params.target_qualified_units:
+            target_reached = True
+            target_reached_time = current_time
+            break
         current_time += dt
 
     average_inventory = inventory_accumulator / max(1, len(snapshots) * len(tracked_inventory))
@@ -1607,6 +1625,10 @@ def simulate_inventory(
         for inventory_id, bin_info in instance.inventory_bins.items()
         if bin_info.item_type == "defect"
     )
+    qualified_storage_total = sum(
+        levels[inventory_id]
+        for inventory_id in instance.qualified_storage_bins
+    )
     return InventorySimulationResult(
         horizon=horizon,
         snapshots=snapshots,
@@ -1615,8 +1637,11 @@ def simulate_inventory(
         average_inventory=average_inventory,
         stop_by_line=stop_by_line,
         qualified_output_total=qualified_total,
+        qualified_storage_total=qualified_storage_total,
         defect_output_total=defect_total,
         capacity_penalty=capacity_penalty,
+        target_reached=target_reached,
+        target_reached_time=target_reached_time,
     )
 
 
@@ -1653,20 +1678,55 @@ def evaluate_decoded_solution(
 ) -> Evaluation:
     weights = weights or FitnessWeights()
     horizon = horizon or instance.global_params.simulation_horizon_s
-    makespan = max((schedule.final_time for schedule in decoded.agv_schedules.values()), default=0.0)
-    total_distance = sum(schedule.total_distance for schedule in decoded.agv_schedules.values())
-    total_energy = sum(schedule.total_energy for schedule in decoded.agv_schedules.values())
-    congestion_wait = sum(schedule.total_wait for schedule in decoded.agv_schedules.values())
-    charge_count = sum(len(schedule.charging_events) for schedule in decoded.agv_schedules.values())
-    late_penalty = sum(execution.late_amount for execution in decoded.task_executions.values())
-    late_task_count = sum(1 for execution in decoded.task_executions.values() if execution.late_amount > 0)
+    inventory_result = simulate_inventory(instance, initial_levels_map, decoded, tasks, horizon)
+    if inventory_result.target_reached and inventory_result.target_reached_time is not None:
+        makespan = inventory_result.target_reached_time
+    else:
+        makespan = max((schedule.final_time for schedule in decoded.agv_schedules.values()), default=0.0)
+        makespan = max(makespan, horizon)
+
+    total_distance = 0.0
+    total_energy = 0.0
+    congestion_wait = 0.0
+    charge_count = 0
+    late_penalty = 0.0
+    late_task_count = 0
+    active_horizon = makespan + 1e-9
+
+    for schedule in decoded.agv_schedules.values():
+        total_distance += sum(
+            traversal.distance
+            for traversal in schedule.traversals
+            if traversal.end_time <= active_horizon
+        )
+        total_energy += sum(
+            traversal.energy_cost
+            for traversal in schedule.traversals
+            if traversal.end_time <= active_horizon
+        )
+        congestion_wait += sum(
+            traversal.wait_before
+            for traversal in schedule.traversals
+            if traversal.end_time <= active_horizon
+        )
+        charge_count += sum(
+            1
+            for event in schedule.charging_events
+            if event.end_time <= active_horizon
+        )
+
+    for execution in decoded.task_executions.values():
+        if execution.drop_end <= active_horizon:
+            late_penalty += execution.late_amount
+            if execution.late_amount > 0:
+                late_task_count += 1
+
     battery_penalty = compute_battery_penalty(instance, decoded)
     load_penalty = compute_load_penalty(instance, decoded.assignment_map, tasks)
-    inventory_result = simulate_inventory(instance, initial_levels_map, decoded, tasks, horizon)
     stop_penalty = inventory_result.line_stop_time * instance.global_params.line_stop_penalty_weight
     target_shortfall_penalty = max(
         0.0,
-        instance.global_params.target_qualified_units - inventory_result.qualified_output_total,
+        instance.global_params.target_qualified_units - inventory_result.qualified_storage_total,
     ) * instance.global_params.target_completion_penalty_weight
 
     fitness = (
@@ -1951,9 +2011,11 @@ def print_inventory_summary(evaluation: Evaluation, target_qualified_units: floa
             "stop_by_line": {key: round(value, 2) for key, value in result.stop_by_line.items()},
             "average_inventory": round(result.average_inventory, 2),
             "qualified_total": round(result.qualified_output_total, 2),
+            "qualified_storage_total": round(result.qualified_storage_total, 2),
             "defect_total": round(result.defect_output_total, 2),
             "capacity_penalty": round(result.capacity_penalty, 4),
-            "target_qualified_reached": result.qualified_output_total >= target_qualified_units,
+            "target_qualified_reached": result.target_reached,
+            "target_reached_time": None if result.target_reached_time is None else round(result.target_reached_time, 2),
         }
     )
 
@@ -2264,8 +2326,16 @@ def launch_gui() -> None:
             f"line_stop={result.best_evaluation.line_stop_time:.2f}, late={result.best_evaluation.late_penalty:.2f}"
         )
         append_summary(
-            f"目标合格品: {result.best_evaluation.inventory_result.qualified_output_total:.2f}/"
+            f"目标合格品(送入成品库存): {result.best_evaluation.inventory_result.qualified_storage_total:.2f}/"
             f"{result.instance.global_params.target_qualified_units:.2f}"
+        )
+        append_summary(
+            "目标达成时间: "
+            + (
+                "未达成"
+                if result.best_evaluation.inventory_result.target_reached_time is None
+                else f"{result.best_evaluation.inventory_result.target_reached_time:.2f}s"
+            )
         )
         append_summary("")
 
