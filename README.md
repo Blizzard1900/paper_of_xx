@@ -8,23 +8,13 @@
 python3 ga_agv_scheduler.py --target-good 200 --agv-count 4 --population 30 --generations 40
 ```
 
-启动 Web 图形界面：
+启动 Tkinter 图形界面：
 
 ```bash
 python3 ga_agv_scheduler.py --ui
 ```
 
-启动后终端会显示访问地址，默认打开：
-
-```text
-http://127.0.0.1:8000
-```
-
-如果需要从外部访问，可指定监听地址：
-
-```bash
-python3 ga_agv_scheduler.py --ui --host 0.0.0.0 --port 8000
-```
+运行后会弹出本机 GUI 窗口，可设置目标入库合格品数、AGV 数量、迭代代数、种群规模和最大仿真时间，并显示每代适应度曲线。
 
 常用参数：
 

@@ -19,11 +19,9 @@ from __future__ import annotations
 
 import argparse
 import copy
-import json
 import random
 import threading
 from dataclasses import dataclass
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 
@@ -1049,9 +1047,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="use mean production cycles and a deterministic 19/20 quality pass pattern",
     )
-    parser.add_argument("--ui", action="store_true", help="open a browser-based UI")
-    parser.add_argument("--host", default="127.0.0.1", help="UI server host")
-    parser.add_argument("--port", type=int, default=8000, help="UI server port")
+    parser.add_argument("--ui", action="store_true", help="open a Tkinter GUI")
     parser.add_argument("--verbose", action="store_true", help="print every generation")
     return parser.parse_args()
 
@@ -1096,247 +1092,207 @@ def format_result_text(genes: Dict[str, float], result: SimulationResult) -> str
     return "\n".join(lines)
 
 
-WEB_UI_HTML = """<!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8" />
-  <title>CKD AGV Genetic Algorithm Scheduler</title>
-  <style>
-    body { font-family: Arial, sans-serif; margin: 24px; background: #f6f8fa; color: #222; }
-    .panel { background: white; border: 1px solid #d0d7de; border-radius: 8px; padding: 16px; margin-bottom: 16px; }
-    .grid { display: grid; grid-template-columns: repeat(6, minmax(120px, 1fr)); gap: 12px; align-items: end; }
-    label { display: block; font-size: 13px; margin-bottom: 4px; color: #555; }
-    input { width: 100%; box-sizing: border-box; padding: 8px; border: 1px solid #c8d0d8; border-radius: 6px; }
-    button { padding: 9px 16px; border: 0; border-radius: 6px; background: #0969da; color: white; cursor: pointer; }
-    button:disabled { background: #8c959f; cursor: not-allowed; }
-    #status { font-weight: bold; margin-bottom: 10px; }
-    canvas { width: 100%; height: 280px; border: 1px solid #d0d7de; background: white; border-radius: 8px; }
-    pre { white-space: pre-wrap; max-height: 300px; overflow: auto; background: #0d1117; color: #e6edf3; padding: 12px; border-radius: 8px; }
-    table { width: 100%; border-collapse: collapse; font-size: 13px; }
-    th, td { border-bottom: 1px solid #d8dee4; padding: 6px; text-align: right; }
-    th:first-child, td:first-child { text-align: left; }
-  </style>
-</head>
-<body>
-  <h2>CKD AGV 遗传算法调度 UI</h2>
-  <div class="panel">
-    <div class="grid">
-      <div><label>目标入库合格品数</label><input id="target_good" type="number" value="200" min="1"></div>
-      <div><label>AGV 数量</label><input id="agv_count" type="number" value="4" min="1"></div>
-      <div><label>迭代代数</label><input id="generations" type="number" value="40" min="1"></div>
-      <div><label>种群规模</label><input id="population" type="number" value="30" min="2"></div>
-      <div><label>最大仿真时间/min</label><input id="max_time" type="number" value="480" min="1"></div>
-      <div>
-        <label><input id="deterministic" type="checkbox" style="width:auto"> 确定性模式</label>
-        <button id="runBtn" onclick="runGa()">运行遗传算法</button>
-      </div>
-    </div>
-  </div>
-  <div class="panel">
-    <div id="status">等待运行</div>
-    <canvas id="chart" width="1000" height="280"></canvas>
-  </div>
-  <div class="panel">
-    <h3>每代结果</h3>
-    <table>
-      <thead><tr><th>代数</th><th>适应度</th><th>完成时间/min</th><th>合格品数量</th></tr></thead>
-      <tbody id="historyBody"></tbody>
-    </table>
-  </div>
-  <div class="panel">
-    <h3>最终结果</h3>
-    <pre id="resultBox">暂无结果</pre>
-  </div>
-<script>
-function getNumber(id) { return Number(document.getElementById(id).value); }
-
-function drawChart(history) {
-  const canvas = document.getElementById("chart");
-  const ctx = canvas.getContext("2d");
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
-  ctx.fillStyle = "#333";
-  ctx.font = "16px Arial";
-  ctx.fillText("每代最佳适应度曲线", 20, 24);
-  if (!history.length) {
-    ctx.fillStyle = "#777";
-    ctx.fillText("运行后显示曲线", 420, 140);
-    return;
-  }
-  const values = history.map(x => x.fitness);
-  const minV = Math.min(...values);
-  const maxV = Math.max(...values);
-  const span = Math.max(maxV - minV, 1e-9);
-  const left = 55, right = 20, top = 40, bottom = 35;
-  const w = canvas.width - left - right;
-  const h = canvas.height - top - bottom;
-  ctx.strokeStyle = "#999";
-  ctx.beginPath();
-  ctx.moveTo(left, top);
-  ctx.lineTo(left, top + h);
-  ctx.lineTo(left + w, top + h);
-  ctx.stroke();
-  ctx.fillStyle = "#555";
-  ctx.font = "12px Arial";
-  ctx.fillText(maxV.toFixed(1), 5, top + 4);
-  ctx.fillText(minV.toFixed(1), 5, top + h);
-  ctx.strokeStyle = "#1f77b4";
-  ctx.lineWidth = 2;
-  ctx.beginPath();
-  history.forEach((item, index) => {
-    const x = left + (history.length === 1 ? 0 : index * w / (history.length - 1));
-    const y = top + h - (item.fitness - minV) * h / span;
-    if (index === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
-  });
-  ctx.stroke();
-  ctx.fillStyle = "#1f77b4";
-  history.forEach((item, index) => {
-    const x = left + (history.length === 1 ? 0 : index * w / (history.length - 1));
-    const y = top + h - (item.fitness - minV) * h / span;
-    ctx.beginPath();
-    ctx.arc(x, y, 3, 0, Math.PI * 2);
-    ctx.fill();
-  });
-}
-
-function renderHistory(history) {
-  const body = document.getElementById("historyBody");
-  body.innerHTML = "";
-  history.forEach(item => {
-    const row = document.createElement("tr");
-    row.innerHTML = `<td>${item.generation}</td><td>${item.fitness.toFixed(2)}</td><td>${item.completion_time.toFixed(2)}</td><td>${item.good_stock}</td>`;
-    body.appendChild(row);
-  });
-}
-
-async function runGa() {
-  const runBtn = document.getElementById("runBtn");
-  const status = document.getElementById("status");
-  const resultBox = document.getElementById("resultBox");
-  const payload = {
-    target_good: getNumber("target_good"),
-    agv_count: getNumber("agv_count"),
-    generations: getNumber("generations"),
-    population: getNumber("population"),
-    max_time: getNumber("max_time"),
-    deterministic: document.getElementById("deterministic").checked
-  };
-  runBtn.disabled = true;
-  status.textContent = "正在运行，请等待...";
-  resultBox.textContent = "运行中...";
-  renderHistory([]);
-  drawChart([]);
-  try {
-    const response = await fetch("/api/run", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload)
-    });
-    const data = await response.json();
-    if (!response.ok) throw new Error(data.error || "运行失败");
-    renderHistory(data.history);
-    drawChart(data.history);
-    status.textContent = `完成 | 最终合格品 ${data.result.good_stock} | 完成时间 ${data.result.completion_time.toFixed(2)} min | 适应度 ${data.result.fitness.toFixed(2)}`;
-    resultBox.textContent = data.report;
-  } catch (err) {
-    status.textContent = "运行出错";
-    resultBox.textContent = String(err);
-  } finally {
-    runBtn.disabled = false;
-  }
-}
-drawChart([]);
-</script>
-</body>
-</html>
-"""
-
-
-def _result_to_dict(result: SimulationResult) -> Dict[str, object]:
-    return {
-        "reached_target": result.reached_target,
-        "completion_time": result.completion_time,
-        "good_stock": result.good_stock,
-        "bad_stock": result.bad_stock,
-        "total_distance": result.total_distance,
-        "total_energy": result.total_energy,
-        "charge_count": result.charge_count,
-        "completed_tasks": result.completed_tasks,
-        "line_blocked_minutes": result.line_blocked_minutes,
-        "pending_tasks": result.pending_tasks,
-        "fitness": result.fitness,
-    }
-
-
-def _record_to_dict(record: GenerationRecord) -> Dict[str, object]:
-    return {
-        "generation": record.generation,
-        "fitness": record.fitness,
-        "completion_time": record.completion_time,
-        "good_stock": record.good_stock,
-    }
-
-
 def launch_ui(default_args: argparse.Namespace) -> None:
-    class SchedulerHandler(BaseHTTPRequestHandler):
-        def _send_bytes(self, status: int, body: bytes, content_type: str) -> None:
-            self.send_response(status)
-            self.send_header("Content-Type", content_type)
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+    try:
+        import tkinter as tk
+        from tkinter import messagebox, ttk
+    except ImportError as exc:
+        raise RuntimeError(
+            "当前 Python 环境没有 tkinter。请在本机安装 tkinter 后运行，"
+            "Windows/Mac 通常自带，Linux 可安装 python3-tk。"
+        ) from exc
 
-        def _send_json(self, status: int, payload: Dict[str, object]) -> None:
-            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-            self._send_bytes(status, body, "application/json; charset=utf-8")
+    root = tk.Tk()
+    root.title("CKD AGV 遗传算法调度")
+    root.geometry("1100x780")
 
-        def log_message(self, format: str, *args: object) -> None:
+    input_frame = ttk.LabelFrame(root, text="参数设置")
+    input_frame.pack(fill="x", padx=10, pady=8)
+
+    fields = [
+        ("目标入库合格品数", "target_good", default_args.target_good),
+        ("AGV 数量", "agv_count", default_args.agv_count),
+        ("迭代代数", "generations", default_args.generations),
+        ("种群规模", "population", default_args.population),
+        ("最大仿真时间/min", "max_time", default_args.max_time),
+    ]
+    entries: Dict[str, tk.Entry] = {}
+    for col, (label, key, value) in enumerate(fields):
+        ttk.Label(input_frame, text=label).grid(row=0, column=col, padx=6, pady=4)
+        entry = ttk.Entry(input_frame, width=16)
+        entry.insert(0, str(value))
+        entry.grid(row=1, column=col, padx=6, pady=4)
+        entries[key] = entry
+
+    deterministic_var = tk.BooleanVar(value=default_args.deterministic)
+    ttk.Checkbutton(input_frame, text="确定性模式", variable=deterministic_var).grid(
+        row=1, column=len(fields), padx=8, pady=4
+    )
+
+    run_button = ttk.Button(input_frame, text="运行遗传算法")
+    run_button.grid(row=1, column=len(fields) + 1, padx=8, pady=4)
+
+    status_var = tk.StringVar(value="等待运行")
+    ttk.Label(root, textvariable=status_var).pack(anchor="w", padx=12)
+
+    canvas = tk.Canvas(
+        root,
+        height=250,
+        bg="white",
+        highlightthickness=1,
+        highlightbackground="#cccccc",
+    )
+    canvas.pack(fill="x", padx=10, pady=8)
+
+    table_frame = ttk.LabelFrame(root, text="每代结果")
+    table_frame.pack(fill="both", expand=True, padx=10, pady=8)
+    columns = ("generation", "fitness", "completion_time", "good_stock")
+    tree = ttk.Treeview(table_frame, columns=columns, show="headings", height=8)
+    tree.heading("generation", text="代数")
+    tree.heading("fitness", text="适应度")
+    tree.heading("completion_time", text="完成时间/min")
+    tree.heading("good_stock", text="合格品数量")
+    for column in columns:
+        tree.column(column, anchor="center", width=140)
+    tree.pack(side="left", fill="both", expand=True)
+    tree_scroll = ttk.Scrollbar(table_frame, orient="vertical", command=tree.yview)
+    tree_scroll.pack(side="right", fill="y")
+    tree.configure(yscrollcommand=tree_scroll.set)
+
+    result_frame = ttk.LabelFrame(root, text="最终结果")
+    result_frame.pack(fill="both", expand=True, padx=10, pady=8)
+    result_text = tk.Text(result_frame, height=10, wrap="none")
+    result_text.pack(side="left", fill="both", expand=True)
+    result_scroll = ttk.Scrollbar(result_frame, orient="vertical", command=result_text.yview)
+    result_scroll.pack(side="right", fill="y")
+    result_text.configure(yscrollcommand=result_scroll.set)
+
+    history: List[GenerationRecord] = []
+
+    def draw_fitness(records: List[GenerationRecord]) -> None:
+        canvas.delete("all")
+        width = max(canvas.winfo_width(), 500)
+        height = max(canvas.winfo_height(), 220)
+        margin = 48
+        canvas.create_text(width / 2, 18, text="每代最佳适应度曲线", fill="#333333")
+        if not records:
+            canvas.create_text(width / 2, height / 2, text="运行后显示曲线", fill="#777777")
             return
 
-        def do_GET(self) -> None:
-            if self.path in ("/", "/index.html"):
-                self._send_bytes(200, WEB_UI_HTML.encode("utf-8"), "text/html; charset=utf-8")
-                return
-            self._send_json(404, {"error": "Not found"})
+        values = [record.fitness for record in records]
+        min_v = min(values)
+        max_v = max(values)
+        span = max(max_v - min_v, 1e-9)
+        x_span = max(len(records) - 1, 1)
 
-        def do_POST(self) -> None:
-            if self.path != "/api/run":
-                self._send_json(404, {"error": "Not found"})
-                return
-            try:
-                length = int(self.headers.get("Content-Length", "0"))
-                payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
-                args = copy.copy(default_args)
-                args.target_good = int(payload.get("target_good", args.target_good))
-                args.agv_count = int(payload.get("agv_count", args.agv_count))
-                args.generations = int(payload.get("generations", args.generations))
-                args.population = int(payload.get("population", args.population))
-                args.max_time = float(payload.get("max_time", args.max_time))
-                args.deterministic = bool(payload.get("deterministic", args.deterministic))
-                args.verbose = False
-                if args.population < 2 or args.generations < 1 or args.agv_count < 1 or args.target_good < 1:
-                    raise ValueError("参数不合法：种群规模>=2，迭代代数/AGV数量/目标合格品数均需>=1。")
-                genes, result, history = run_ga(args)
-                self._send_json(
-                    200,
-                    {
-                        "result": _result_to_dict(result),
-                        "history": [_record_to_dict(record) for record in history],
-                        "report": format_result_text(genes, result),
-                    },
-                )
-            except Exception as exc:
-                self._send_json(400, {"error": str(exc)})
+        canvas.create_line(margin, height - margin, width - margin, height - margin, fill="#999999")
+        canvas.create_line(margin, margin, margin, height - margin, fill="#999999")
+        canvas.create_text(margin + 4, margin - 14, text=f"{max_v:.1f}", anchor="w", fill="#666666")
+        canvas.create_text(margin + 4, height - margin + 16, text=f"{min_v:.1f}", anchor="w", fill="#666666")
 
-    server = ThreadingHTTPServer((default_args.host, default_args.port), SchedulerHandler)
-    url = f"http://{default_args.host}:{default_args.port}"
-    print(f"Browser UI is running at {url}")
-    print("Open this address in your browser. Press Ctrl+C to stop.")
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print("\nStopping UI server.")
-    finally:
-        server.server_close()
+        points: List[float] = []
+        for idx, value in enumerate(values):
+            x = margin + idx * (width - 2 * margin) / x_span
+            y = height - margin - (value - min_v) * (height - 2 * margin) / span
+            points.extend([x, y])
+            canvas.create_oval(x - 3, y - 3, x + 3, y + 3, fill="#1f77b4", outline="")
+        if len(points) >= 4:
+            canvas.create_line(*points, fill="#1f77b4", width=2)
+
+    def build_args_from_ui() -> argparse.Namespace:
+        args = copy.copy(default_args)
+        try:
+            args.target_good = int(entries["target_good"].get())
+            args.agv_count = int(entries["agv_count"].get())
+            args.generations = int(entries["generations"].get())
+            args.population = int(entries["population"].get())
+            args.max_time = float(entries["max_time"].get())
+        except ValueError as exc:
+            raise ValueError("请输入有效的数字参数。") from exc
+        args.deterministic = deterministic_var.get()
+        args.verbose = False
+        return args
+
+    def validate_ui_args(args: argparse.Namespace) -> None:
+        if args.population < 2:
+            raise ValueError("种群规模必须至少为 2。")
+        if args.generations < 1:
+            raise ValueError("迭代代数必须至少为 1。")
+        if args.agv_count < 1:
+            raise ValueError("AGV 数量必须至少为 1。")
+        if args.target_good < 1:
+            raise ValueError("目标入库合格品数必须至少为 1。")
+
+    def handle_progress(record: GenerationRecord) -> None:
+        history.append(record)
+        tree.insert(
+            "",
+            "end",
+            values=(
+                record.generation,
+                f"{record.fitness:.2f}",
+                f"{record.completion_time:.2f}",
+                record.good_stock,
+            ),
+        )
+        tree.yview_moveto(1.0)
+        status_var.set(
+            f"第 {record.generation} 代 | 适应度 {record.fitness:.2f} | "
+            f"完成时间 {record.completion_time:.2f} min | 合格品 {record.good_stock}"
+        )
+        draw_fitness(history)
+
+    def handle_done(
+        genes: Dict[str, float],
+        result: SimulationResult,
+        records: List[GenerationRecord],
+    ) -> None:
+        run_button.configure(state="normal")
+        status_var.set(
+            f"完成 | 最终合格品 {result.good_stock} | "
+            f"完成时间 {result.completion_time:.2f} min | 适应度 {result.fitness:.2f}"
+        )
+        result_text.delete("1.0", "end")
+        result_text.insert("end", format_result_text(genes, result))
+        draw_fitness(records)
+
+    def handle_error(exc: Exception) -> None:
+        run_button.configure(state="normal")
+        status_var.set("运行出错")
+        messagebox.showerror("运行出错", str(exc))
+
+    def worker(args: argparse.Namespace) -> None:
+        def on_progress(record: GenerationRecord) -> None:
+            root.after(0, handle_progress, record)
+
+        try:
+            genes, result, records = run_ga(args, progress_callback=on_progress)
+        except Exception as exc:
+            root.after(0, handle_error, exc)
+            return
+        root.after(0, handle_done, genes, result, records)
+
+    def start_run() -> None:
+        try:
+            args = build_args_from_ui()
+            validate_ui_args(args)
+        except ValueError as exc:
+            messagebox.showerror("参数错误", str(exc))
+            return
+
+        history.clear()
+        for item in tree.get_children():
+            tree.delete(item)
+        result_text.delete("1.0", "end")
+        draw_fitness(history)
+        run_button.configure(state="disabled")
+        status_var.set("正在运行...")
+        thread = threading.Thread(target=worker, args=(args,), daemon=True)
+        thread.start()
+
+    run_button.configure(command=start_run)
+    draw_fitness(history)
+    root.mainloop()
 
 
 def main() -> None:
