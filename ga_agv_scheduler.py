@@ -1048,6 +1048,7 @@ def parse_args() -> argparse.Namespace:
         help="use mean production cycles and a deterministic 19/20 quality pass pattern",
     )
     parser.add_argument("--ui", action="store_true", help="open a Tkinter GUI")
+    parser.add_argument("--cli", action="store_true", help="run in command-line mode instead of GUI")
     parser.add_argument("--verbose", action="store_true", help="print every generation")
     return parser.parse_args()
 
@@ -1297,7 +1298,7 @@ def launch_ui(default_args: argparse.Namespace) -> None:
 
 def main() -> None:
     args = parse_args()
-    if args.ui:
+    if args.ui or not args.cli:
         launch_ui(args)
         return
 
