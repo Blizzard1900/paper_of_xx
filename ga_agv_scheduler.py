@@ -21,8 +21,9 @@ import argparse
 import copy
 import math
 import random
+import threading
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 
 Coordinate = Tuple[float, float]
@@ -192,6 +193,14 @@ class SimulationResult:
     line_blocked_minutes: float
     pending_tasks: int
     fitness: float
+
+
+@dataclass
+class GenerationRecord:
+    generation: int
+    fitness: float
+    completion_time: float
+    good_stock: int
 
 
 class WorkshopSimulator:
@@ -929,11 +938,15 @@ def evaluate_genes(
     return simulator.run()
 
 
-def run_ga(args: argparse.Namespace) -> Tuple[Dict[str, float], SimulationResult]:
+def run_ga(
+    args: argparse.Namespace,
+    progress_callback: Optional[Callable[[GenerationRecord], None]] = None,
+) -> Tuple[Dict[str, float], SimulationResult, List[GenerationRecord]]:
     rng = random.Random(args.seed)
     population = [random_genes(rng) for _ in range(args.population)]
     best_genes: Optional[Dict[str, float]] = None
     best_result: Optional[SimulationResult] = None
+    history: List[GenerationRecord] = []
 
     for generation in range(1, args.generations + 1):
         evaluated: List[Tuple[float, Dict[str, float], SimulationResult]] = []
@@ -960,6 +973,16 @@ def run_ga(args: argparse.Namespace) -> Tuple[Dict[str, float], SimulationResult
         if best_result is None or generation_best_fitness < best_result.fitness:
             best_genes = copy.deepcopy(generation_best_genes)
             best_result = generation_best_result
+
+        record = GenerationRecord(
+            generation=generation,
+            fitness=generation_best_fitness,
+            completion_time=generation_best_result.completion_time,
+            good_stock=generation_best_result.good_stock,
+        )
+        history.append(record)
+        if progress_callback is not None:
+            progress_callback(record)
 
         if args.verbose or generation == 1 or generation == args.generations:
             print(
@@ -994,7 +1017,7 @@ def run_ga(args: argparse.Namespace) -> Tuple[Dict[str, float], SimulationResult
         initial_material_fill_ratio=args.initial_material_fill_ratio,
         initial_wip_fill_ratio=args.initial_wip_fill_ratio,
     )
-    return best_genes, final_result
+    return best_genes, final_result, history
 
 
 def parse_args() -> argparse.Namespace:
@@ -1025,6 +1048,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="use mean production cycles and a deterministic 19/20 quality pass pattern",
     )
+    parser.add_argument("--ui", action="store_true", help="open a Tkinter UI")
     parser.add_argument("--verbose", action="store_true", help="print every generation")
     return parser.parse_args()
 
@@ -1048,8 +1072,209 @@ def print_report(genes: Dict[str, float], result: SimulationResult) -> None:
     print(f"Fitness              : {result.fitness:.2f}")
 
 
+def format_result_text(genes: Dict[str, float], result: SimulationResult) -> str:
+    lines = [
+        "=== Simulation result ===",
+        f"Reached target       : {result.reached_target}",
+        f"Completion time      : {result.completion_time:.2f} min",
+        f"Qualified stock      : {result.good_stock}",
+        f"Defective stock      : {result.bad_stock}",
+        f"Completed AGV tasks  : {result.completed_tasks}",
+        f"Total AGV distance   : {result.total_distance:.2f} m",
+        f"Total AGV energy     : {result.total_energy:.2f} kWh",
+        f"Charging count       : {result.charge_count}",
+        f"Line blocked time    : {result.line_blocked_minutes:.2f} station-min",
+        f"Pending tasks        : {result.pending_tasks}",
+        f"Fitness              : {result.fitness:.2f}",
+        "",
+        "=== Best dispatch genes ===",
+    ]
+    lines.extend(f"{name:20s}: {genes[name]:.4f}" for name in GENE_NAMES)
+    return "\n".join(lines)
+
+
+def launch_ui(default_args: argparse.Namespace) -> None:
+    try:
+        import tkinter as tk
+        from tkinter import messagebox, ttk
+    except ImportError as exc:
+        raise RuntimeError("Tkinter is not available in this Python environment.") from exc
+
+    root = tk.Tk()
+    root.title("CKD AGV Genetic Algorithm Scheduler")
+    root.geometry("980x720")
+
+    input_frame = ttk.LabelFrame(root, text="参数设置")
+    input_frame.pack(fill="x", padx=10, pady=8)
+
+    fields = [
+        ("目标入库合格品数", "target_good", default_args.target_good),
+        ("AGV 数量", "agv_count", default_args.agv_count),
+        ("迭代代数", "generations", default_args.generations),
+        ("种群规模", "population", default_args.population),
+        ("最大仿真时间/min", "max_time", default_args.max_time),
+    ]
+    entries: Dict[str, tk.Entry] = {}
+    for col, (label, key, value) in enumerate(fields):
+        ttk.Label(input_frame, text=label).grid(row=0, column=col, padx=5, pady=4)
+        entry = ttk.Entry(input_frame, width=14)
+        entry.insert(0, str(value))
+        entry.grid(row=1, column=col, padx=5, pady=4)
+        entries[key] = entry
+
+    deterministic_var = tk.BooleanVar(value=default_args.deterministic)
+    ttk.Checkbutton(input_frame, text="确定性模式", variable=deterministic_var).grid(
+        row=1, column=len(fields), padx=8, pady=4
+    )
+
+    run_button = ttk.Button(input_frame, text="运行遗传算法")
+    run_button.grid(row=1, column=len(fields) + 1, padx=8, pady=4)
+
+    progress_var = tk.StringVar(value="等待运行")
+    ttk.Label(root, textvariable=progress_var).pack(anchor="w", padx=12)
+
+    canvas = tk.Canvas(root, height=240, bg="white", highlightthickness=1, highlightbackground="#cccccc")
+    canvas.pack(fill="x", padx=10, pady=8)
+
+    text_frame = ttk.Frame(root)
+    text_frame.pack(fill="both", expand=True, padx=10, pady=8)
+    output_text = tk.Text(text_frame, wrap="none")
+    output_text.pack(side="left", fill="both", expand=True)
+    scrollbar = ttk.Scrollbar(text_frame, orient="vertical", command=output_text.yview)
+    scrollbar.pack(side="right", fill="y")
+    output_text.configure(yscrollcommand=scrollbar.set)
+
+    history: List[GenerationRecord] = []
+
+    def append_log(line: str) -> None:
+        output_text.insert("end", line + "\n")
+        output_text.see("end")
+
+    def draw_fitness(records: List[GenerationRecord]) -> None:
+        canvas.delete("all")
+        width = max(canvas.winfo_width(), 300)
+        height = max(canvas.winfo_height(), 200)
+        margin = 40
+        canvas.create_text(width / 2, 15, text="每代最佳适应度曲线", fill="#333333")
+        if not records:
+            canvas.create_text(width / 2, height / 2, text="运行后显示曲线", fill="#777777")
+            return
+
+        values = [record.fitness for record in records]
+        min_v = min(values)
+        max_v = max(values)
+        span = max(max_v - min_v, 1e-9)
+        x_span = max(len(records) - 1, 1)
+
+        canvas.create_line(margin, height - margin, width - margin, height - margin, fill="#999999")
+        canvas.create_line(margin, margin, margin, height - margin, fill="#999999")
+        canvas.create_text(margin + 5, margin - 12, text=f"{max_v:.1f}", anchor="w", fill="#666666")
+        canvas.create_text(margin + 5, height - margin + 14, text=f"{min_v:.1f}", anchor="w", fill="#666666")
+
+        points = []
+        for idx, value in enumerate(values):
+            x = margin + idx * (width - 2 * margin) / x_span
+            y = height - margin - (value - min_v) * (height - 2 * margin) / span
+            points.extend([x, y])
+            canvas.create_oval(x - 2, y - 2, x + 2, y + 2, fill="#1f77b4", outline="")
+        if len(points) >= 4:
+            canvas.create_line(*points, fill="#1f77b4", width=2)
+
+    def build_args_from_ui() -> argparse.Namespace:
+        args = copy.copy(default_args)
+        try:
+            args.target_good = int(entries["target_good"].get())
+            args.agv_count = int(entries["agv_count"].get())
+            args.generations = int(entries["generations"].get())
+            args.population = int(entries["population"].get())
+            args.max_time = float(entries["max_time"].get())
+        except ValueError as exc:
+            raise ValueError("请输入有效的数字参数。") from exc
+        args.deterministic = deterministic_var.get()
+        args.verbose = False
+        return args
+
+    def validate_ui_args(args: argparse.Namespace) -> None:
+        if args.population < 2:
+            raise ValueError("种群规模必须至少为 2。")
+        if args.generations < 1:
+            raise ValueError("迭代代数必须至少为 1。")
+        if args.agv_count < 1:
+            raise ValueError("AGV 数量必须至少为 1。")
+        if args.target_good < 1:
+            raise ValueError("目标入库合格品数必须至少为 1。")
+
+    def worker(args: argparse.Namespace) -> None:
+        def on_progress(record: GenerationRecord) -> None:
+            root.after(0, handle_progress, record)
+
+        try:
+            genes, result, records = run_ga(args, progress_callback=on_progress)
+        except Exception as exc:  # pragma: no cover - GUI runtime path
+            root.after(0, handle_error, exc)
+            return
+        root.after(0, handle_done, genes, result, records)
+
+    def handle_progress(record: GenerationRecord) -> None:
+        history.append(record)
+        progress_var.set(
+            f"第 {record.generation} 代 | 适应度 {record.fitness:.2f} | "
+            f"完成时间 {record.completion_time:.2f} min | 合格品 {record.good_stock}"
+        )
+        append_log(
+            f"Generation {record.generation:03d} | "
+            f"fitness={record.fitness:.2f} | "
+            f"time={record.completion_time:.2f} min | "
+            f"good={record.good_stock}"
+        )
+        draw_fitness(history)
+
+    def handle_done(
+        genes: Dict[str, float],
+        result: SimulationResult,
+        records: List[GenerationRecord],
+    ) -> None:
+        run_button.configure(state="normal")
+        progress_var.set(
+            f"完成 | 最终合格品 {result.good_stock} | "
+            f"完成时间 {result.completion_time:.2f} min | 适应度 {result.fitness:.2f}"
+        )
+        append_log("")
+        append_log(format_result_text(genes, result))
+        draw_fitness(records)
+
+    def handle_error(exc: Exception) -> None:
+        run_button.configure(state="normal")
+        progress_var.set("运行出错")
+        messagebox.showerror("运行出错", str(exc))
+
+    def start_run() -> None:
+        try:
+            args = build_args_from_ui()
+            validate_ui_args(args)
+        except ValueError as exc:
+            messagebox.showerror("参数错误", str(exc))
+            return
+
+        history.clear()
+        output_text.delete("1.0", "end")
+        draw_fitness(history)
+        run_button.configure(state="disabled")
+        progress_var.set("正在运行...")
+        thread = threading.Thread(target=worker, args=(args,), daemon=True)
+        thread.start()
+
+    run_button.configure(command=start_run)
+    draw_fitness(history)
+    root.mainloop()
+
+
 def main() -> None:
     args = parse_args()
+    if args.ui:
+        launch_ui(args)
+        return
+
     if args.population < 2:
         raise ValueError("--population must be at least 2")
     if args.generations < 1:
@@ -1063,7 +1288,7 @@ def main() -> None:
     if not 0.0 <= args.initial_wip_fill_ratio <= 1.0:
         raise ValueError("--initial-wip-fill-ratio must be between 0 and 1")
 
-    genes, result = run_ga(args)
+    genes, result, _history = run_ga(args)
     print_report(genes, result)
 
 

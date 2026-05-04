@@ -8,6 +8,12 @@
 python3 ga_agv_scheduler.py --target-good 200 --agv-count 4 --population 30 --generations 40
 ```
 
+启动图形界面：
+
+```bash
+python3 ga_agv_scheduler.py --ui
+```
+
 常用参数：
 
 - `--target-good`：目标合格品入库数量，达到后停止仿真。
