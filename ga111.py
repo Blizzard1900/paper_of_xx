@@ -6,6 +6,7 @@ import random
 from dataclasses import dataclass, field
 from pathlib import Path
 from pprint import pprint
+import threading
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import networkx as nx
@@ -343,6 +344,9 @@ class GAGenerationStats:
 class GAResult:
     best_individual: GAIndividual
     history: List[GAGenerationStats]
+
+
+GAProgressCallback = Optional[callable]
 
 
 def clamp(value: float, lower: float, upper: float) -> float:
@@ -1129,6 +1133,17 @@ class TaskGenerator:
         return "generic_transfer"
 
 
+def task_priority_score(task: Task) -> Tuple[float, float, float]:
+    slack = max(1.0, task.latest_finish - task.earliest_start)
+    task_type_bias = {
+        "semi_finished_transfer": 0.75,
+        "material_replenishment": 1.0,
+        "finished_putaway": 1.2,
+        "defect_putaway": 1.5,
+    }.get(task.task_type, 1.3)
+    return (slack / task_type_bias, task.earliest_start, task.latest_finish)
+
+
 def project_agv_state_after_task(
     agv: AGV,
     current_node: str,
@@ -1176,7 +1191,13 @@ def greedy_assign_by_priority(
 ) -> Dict[str, List[str]]:
     task_ids = list(solution["task_ids"])
     priorities = list(solution["priority"])
-    ordered = sorted(zip(priorities, task_ids), key=lambda item: item[0])
+    ordered = sorted(
+        zip(priorities, task_ids),
+        key=lambda item: (
+            item[0],
+            task_priority_score(tasks[item[1]]),
+        ),
+    )
 
     agv_state = {
         agv_id: {
@@ -1191,7 +1212,7 @@ def greedy_assign_by_priority(
     for _, task_id in ordered:
         task = tasks[task_id]
         best_agv_id: Optional[str] = None
-        best_finish = math.inf
+        best_score = math.inf
         best_state: Optional[Tuple[float, str, float]] = None
         for agv_id, agv in instance.agvs.items():
             if task.qty > agv.load_capacity:
@@ -1204,8 +1225,21 @@ def greedy_assign_by_priority(
                 task=task,
                 instance=instance,
             )
-            if projected[0] < best_finish:
-                best_finish = projected[0]
+            source_distance = shortest_path_metrics(
+                instance,
+                str(agv_state[agv_id]["node"]),
+                task.pickup_node,
+            )[1]
+            tardiness = max(0.0, projected[0] - task.latest_finish)
+            buffer_pressure = max(0.0, task.latest_finish - task.earliest_start)
+            score = (
+                projected[0]
+                + 8.0 * tardiness
+                + 0.1 * source_distance
+                + 0.02 * buffer_pressure
+            )
+            if score < best_score:
+                best_score = score
                 best_agv_id = agv_id
                 best_state = projected
         if best_agv_id is None or best_state is None:
@@ -1688,13 +1722,13 @@ def build_random_solution(task_ids: Sequence[str], rng: random.Random) -> Dict[s
 
 def build_heuristic_solution(tasks: Mapping[str, Task], rng: random.Random) -> Dict[str, object]:
     task_ids = list(tasks.keys())
-    slack_pairs = []
-    for task_id in task_ids:
-        task = tasks[task_id]
-        slack = max(0.0, task.latest_finish - task.earliest_start)
-        priority = slack + rng.uniform(0.0, 1.0)
-        slack_pairs.append((task_id, priority))
-    return build_priority_solution(task_ids, [priority for _, priority in slack_pairs])
+    ordered = sorted(task_ids, key=lambda task_id: task_priority_score(tasks[task_id]))
+    base_rank = {task_id: rank for rank, task_id in enumerate(ordered)}
+    priorities = [
+        float(base_rank[task_id]) + rng.uniform(0.0, 0.25)
+        for task_id in task_ids
+    ]
+    return build_priority_solution(task_ids, priorities)
 
 
 def evaluate_individual(
@@ -1767,6 +1801,7 @@ def solve_ga(
     *,
     config: Optional[GAConfig] = None,
     seed: int = 42,
+    progress_callback: GAProgressCallback = None,
 ) -> GAResult:
     config = config or GAConfig()
     rng = random.Random(seed)
@@ -1787,6 +1822,8 @@ def solve_ga(
                 best_line_stop=generation_best.evaluation.line_stop_time,
             )
         )
+        if progress_callback is not None:
+            progress_callback(history[-1], generation + 1, config.generations)
         if generation_best.fitness < best.fitness:
             best = clone_individual(generation_best)
 
@@ -1950,6 +1987,7 @@ def run_experiment(
     agv_count: int = 3,
     population_size: int = 40,
     seed: int = 42,
+    progress_callback: GAProgressCallback = None,
 ) -> ExperimentRunResult:
     instance = build_instance(
         seed=seed,
@@ -1979,6 +2017,7 @@ def run_experiment(
             heuristic_seed_count=min(8, population_size),
         ),
         seed=seed,
+        progress_callback=progress_callback,
     )
     best_solution = ga_result.best_individual.solution
     best_evaluation = ga_result.best_individual.evaluation
@@ -2056,6 +2095,8 @@ def launch_gui() -> None:
     root = tk.Tk()
     root.title("AGV 调度实验交互界面")
     root.geometry("1400x900")
+    root.columnconfigure(0, weight=1)
+    root.rowconfigure(1, weight=1)
 
     control_frame = ttk.LabelFrame(root, text="实验参数")
     control_frame.pack(fill="x", padx=10, pady=10)
@@ -2075,6 +2116,12 @@ def launch_gui() -> None:
     ttk.Label(control_frame, text="种群规模").grid(row=0, column=6, padx=6, pady=6, sticky="w")
     pop_var = tk.StringVar(value="40")
     ttk.Entry(control_frame, textvariable=pop_var, width=12).grid(row=0, column=7, padx=6, pady=6)
+
+    progress_var = tk.DoubleVar(value=0.0)
+    status_var = tk.StringVar(value="就绪")
+    progress_bar = ttk.Progressbar(control_frame, orient="horizontal", length=260, mode="determinate", variable=progress_var, maximum=100.0)
+    progress_bar.grid(row=1, column=0, columnspan=4, padx=6, pady=6, sticky="we")
+    ttk.Label(control_frame, textvariable=status_var).grid(row=1, column=4, columnspan=4, padx=6, pady=6, sticky="w")
 
     notebook = ttk.Notebook(root)
     notebook.pack(fill="both", expand=True, padx=10, pady=10)
@@ -2101,17 +2148,50 @@ def launch_gui() -> None:
     ]:
         history_tree.heading(column, text=title)
         history_tree.column(column, width=width, anchor="center")
-    history_tree.pack(side="left", fill="y", padx=(0, 10), pady=5)
+    tree_scroll = ttk.Scrollbar(history_frame, orient="vertical", command=history_tree.yview)
+    history_tree.configure(yscrollcommand=tree_scroll.set)
+    history_tree.pack(side="left", fill="y", padx=(0, 0), pady=5)
+    tree_scroll.pack(side="left", fill="y", padx=(0, 10), pady=5)
 
     chart_container = ttk.Frame(history_frame)
     chart_container.pack(side="left", fill="both", expand=True)
     canvas_holder: Dict[str, object] = {}
+    run_state = {"running": False}
 
     def append_summary(text: str) -> None:
         summary_text.insert("end", text + "\n")
         summary_text.see("end")
 
+    def clear_outputs() -> None:
+        summary_text.delete("1.0", "end")
+        for item in history_tree.get_children():
+            history_tree.delete(item)
+        if "canvas" in canvas_holder:
+            canvas_holder["canvas"].get_tk_widget().destroy()
+            canvas_holder.clear()
+        progress_var.set(0.0)
+        status_var.set("已清空")
+
+    def update_generation_row(item: GAGenerationStats, done: int, total: int) -> None:
+        history_tree.insert(
+            "",
+            "end",
+            values=(
+                item.generation,
+                f"{item.best_fitness:.2f}",
+                f"{item.average_fitness:.2f}",
+                f"{item.best_makespan:.2f}",
+                f"{item.best_line_stop:.2f}",
+            ),
+        )
+        progress_var.set((done / max(1, total)) * 100.0)
+        status_var.set(f"运行中：第 {done}/{total} 代")
+        history_tree.yview_moveto(1.0)
+        root.update_idletasks()
+
     def run_from_ui() -> None:
+        if run_state["running"]:
+            return
         try:
             generations = int(generations_var.get())
             target_qualified_units = float(target_var.get())
@@ -2124,26 +2204,38 @@ def launch_gui() -> None:
                 messagebox.showerror("参数错误", "请输入合法的正数参数。")
             return
 
-        summary_text.delete("1.0", "end")
-        for item in history_tree.get_children():
-            history_tree.delete(item)
-        if "canvas" in canvas_holder:
-            canvas_holder["canvas"].get_tk_widget().destroy()
-            canvas_holder.clear()
+        clear_outputs()
+        run_state["running"] = True
+        status_var.set("正在初始化...")
 
-        try:
-            result = run_experiment(
-                generations=generations,
-                target_qualified_units=target_qualified_units,
-                agv_count=agv_count,
-                population_size=population_size,
-                seed=42,
-            )
-        except Exception as exc:
-            if messagebox is not None:
-                messagebox.showerror("运行失败", str(exc))
-            return
+        def worker() -> None:
+            try:
+                result = run_experiment(
+                    generations=generations,
+                    target_qualified_units=target_qualified_units,
+                    agv_count=agv_count,
+                    population_size=population_size,
+                    seed=42,
+                    progress_callback=lambda item, done, total: root.after(
+                        0, update_generation_row, item, done, total
+                    ),
+                )
+                root.after(0, lambda: render_result(result, generations, target_qualified_units, agv_count, population_size))
+            except Exception as exc:
+                root.after(0, lambda: messagebox.showerror("运行失败", str(exc)) if messagebox is not None else None)
+                root.after(0, lambda: status_var.set("运行失败"))
+            finally:
+                root.after(0, lambda: run_state.update({"running": False}))
 
+        threading.Thread(target=worker, daemon=True).start()
+
+    def render_result(
+        result: ExperimentRunResult,
+        generations: int,
+        target_qualified_units: float,
+        agv_count: int,
+        population_size: int,
+    ) -> None:
         append_summary("=== 参数 ===")
         append_summary(f"GA迭代次数: {generations}")
         append_summary(f"目标合格品数量: {target_qualified_units}")
@@ -2160,47 +2252,44 @@ def launch_gui() -> None:
 
         append_summary("=== 结果对比 ===")
         append_summary(
-            f"人工: fitness={result.manual_evaluation.fitness:.2f}, makespan={result.manual_evaluation.makespan:.2f}, line_stop={result.manual_evaluation.line_stop_time:.2f}"
+            f"人工: fitness={result.manual_evaluation.fitness:.2f}, makespan={result.manual_evaluation.makespan:.2f}, "
+            f"line_stop={result.manual_evaluation.line_stop_time:.2f}, late={result.manual_evaluation.late_penalty:.2f}"
         )
         append_summary(
-            f"随机: fitness={result.random_evaluation.fitness:.2f}, makespan={result.random_evaluation.makespan:.2f}, line_stop={result.random_evaluation.line_stop_time:.2f}"
+            f"随机: fitness={result.random_evaluation.fitness:.2f}, makespan={result.random_evaluation.makespan:.2f}, "
+            f"line_stop={result.random_evaluation.line_stop_time:.2f}, late={result.random_evaluation.late_penalty:.2f}"
         )
         append_summary(
-            f"GA最优: fitness={result.best_evaluation.fitness:.2f}, makespan={result.best_evaluation.makespan:.2f}, line_stop={result.best_evaluation.line_stop_time:.2f}"
+            f"GA最优: fitness={result.best_evaluation.fitness:.2f}, makespan={result.best_evaluation.makespan:.2f}, "
+            f"line_stop={result.best_evaluation.line_stop_time:.2f}, late={result.best_evaluation.late_penalty:.2f}"
         )
         append_summary(
-            f"目标合格品: {result.best_evaluation.inventory_result.qualified_output_total:.2f}/{result.instance.global_params.target_qualified_units:.2f}"
+            f"目标合格品: {result.best_evaluation.inventory_result.qualified_output_total:.2f}/"
+            f"{result.instance.global_params.target_qualified_units:.2f}"
         )
         append_summary("")
 
         append_summary("=== 最优AGV调度 ===")
         for agv_id, schedule in result.best_decoded.agv_schedules.items():
             append_summary(
-                f"{agv_id}: tasks={schedule.assigned_tasks}, final_time={schedule.final_time:.2f}, battery={schedule.final_battery:.4f}"
-            )
-
-        for item in result.ga_result.history:
-            history_tree.insert(
-                "",
-                "end",
-                values=(
-                    item.generation,
-                    f"{item.best_fitness:.2f}",
-                    f"{item.average_fitness:.2f}",
-                    f"{item.best_makespan:.2f}",
-                    f"{item.best_line_stop:.2f}",
-                ),
+                f"{agv_id}: tasks={schedule.assigned_tasks}, final_time={schedule.final_time:.2f}, "
+                f"battery={schedule.final_battery:.4f}, wait={schedule.total_wait:.2f}"
             )
 
         figure = build_history_figure(result.ga_result.history)
         if figure is not None:
+            if "canvas" in canvas_holder:
+                canvas_holder["canvas"].get_tk_widget().destroy()
             canvas = FigureCanvasTkAgg(figure, master=chart_container)
             canvas.draw()
             canvas.get_tk_widget().pack(fill="both", expand=True)
             canvas_holder["canvas"] = canvas
+        progress_var.set(100.0)
+        status_var.set("运行完成")
 
-    ttk.Button(control_frame, text="运行实验", command=run_from_ui).grid(row=0, column=8, padx=12, pady=6)
-    ttk.Button(control_frame, text="退出", command=root.destroy).grid(row=0, column=9, padx=6, pady=6)
+    ttk.Button(control_frame, text="开始", command=run_from_ui).grid(row=0, column=8, padx=12, pady=6)
+    ttk.Button(control_frame, text="清空输出", command=clear_outputs).grid(row=0, column=9, padx=6, pady=6)
+    ttk.Button(control_frame, text="退出", command=root.destroy).grid(row=0, column=10, padx=6, pady=6)
 
     root.mainloop()
 
