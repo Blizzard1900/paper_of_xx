@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 import random
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -8,6 +9,16 @@ from pprint import pprint
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import networkx as nx
+
+try:
+    import tkinter as tk
+    from tkinter import messagebox, ttk
+    from tkinter.scrolledtext import ScrolledText
+except Exception:
+    tk = None
+    ttk = None
+    messagebox = None
+    ScrolledText = None
 
 
 SECONDS_PER_MINUTE = 60.0
@@ -41,6 +52,7 @@ class GlobalParams:
     cycle_sigma_min: float = 0.01
     qualified_rate: float = 0.95
     target_qualified_units: float = 50.0
+    target_completion_penalty_weight: float = 2000.0
     output_buffer_capacity: float = 120.0
     random_seed: int = 42
 
@@ -261,8 +273,24 @@ class Evaluation:
     line_stop_time: float
     average_inventory: float
     stop_penalty: float
+    target_shortfall_penalty: float
     inventory_result: InventorySimulationResult
     agv_schedules: Dict[str, AGVDecodedSchedule]
+
+
+@dataclass
+class ExperimentRunResult:
+    instance: Instance
+    task_pool: Dict[str, Task]
+    planning_levels: Dict[str, float]
+    manual_decoded: DecodedSolution
+    manual_evaluation: Evaluation
+    random_solution: Dict[str, object]
+    random_evaluation: Evaluation
+    best_solution: Dict[str, object]
+    best_decoded: DecodedSolution
+    best_evaluation: Evaluation
+    ga_result: GAResult
 
 
 @dataclass(frozen=True)
@@ -847,12 +875,24 @@ def build_inventory_and_workstations(
     )
 
 
-def build_agvs(params: GlobalParams) -> Dict[str, AGV]:
-    return {
-        "AGV_1": AGV("AGV_1", "C1", params.battery_capacity_kwh, params.battery_capacity_kwh, params.battery_threshold_kwh, params.battery_min_kwh, params.charge_power_kw, 100.0, "idle"),
-        "AGV_2": AGV("AGV_2", "J5", params.battery_capacity_kwh, params.battery_capacity_kwh, params.battery_threshold_kwh, params.battery_min_kwh, params.charge_power_kw, 100.0, "idle"),
-        "AGV_3": AGV("AGV_3", "J10", params.battery_capacity_kwh, params.battery_capacity_kwh, params.battery_threshold_kwh, params.battery_min_kwh, params.charge_power_kw, 100.0, "idle"),
-    }
+def build_agvs(params: GlobalParams, agv_count: int = 3) -> Dict[str, AGV]:
+    start_nodes = ["C1", "J5", "J10", "C2", "J1", "J4", "C3", "J3", "J7", "J8"]
+    agvs: Dict[str, AGV] = {}
+    for index in range(max(1, agv_count)):
+        agv_id = f"AGV_{index + 1}"
+        start_node = start_nodes[index % len(start_nodes)]
+        agvs[agv_id] = AGV(
+            agv_id,
+            start_node,
+            params.battery_capacity_kwh,
+            params.battery_capacity_kwh,
+            params.battery_threshold_kwh,
+            params.battery_min_kwh,
+            params.charge_power_kw,
+            100.0,
+            "idle",
+        )
+    return agvs
 
 
 def precompute_shortest_paths(instance: Instance) -> None:
@@ -870,8 +910,16 @@ def precompute_shortest_paths(instance: Instance) -> None:
             instance.shortest_metric_matrix[(source, target)] = (distance, base_time, energy)
 
 
-def build_instance(seed: int = 42) -> Instance:
-    params = GlobalParams(random_seed=seed)
+def build_instance(
+    seed: int = 42,
+    *,
+    agv_count: int = 3,
+    target_qualified_units: float = 50.0,
+) -> Instance:
+    params = GlobalParams(
+        random_seed=seed,
+        target_qualified_units=target_qualified_units,
+    )
     rng = random.Random(seed)
     nodes = build_nodes(params)
     edges = build_edges(nodes, params)
@@ -889,7 +937,7 @@ def build_instance(seed: int = 42) -> Instance:
         nodes=nodes,
         edges=edges,
         graph=graph,
-        agvs=build_agvs(params),
+        agvs=build_agvs(params, agv_count=agv_count),
         chargers=[f"C{idx}" for idx in range(1, 11)],
         inventory_bins=inventory_bins,
         workstations=workstations,
@@ -1582,6 +1630,10 @@ def evaluate_decoded_solution(
     load_penalty = compute_load_penalty(instance, decoded.assignment_map, tasks)
     inventory_result = simulate_inventory(instance, initial_levels_map, decoded, tasks, horizon)
     stop_penalty = inventory_result.line_stop_time * instance.global_params.line_stop_penalty_weight
+    target_shortfall_penalty = max(
+        0.0,
+        instance.global_params.target_qualified_units - inventory_result.qualified_output_total,
+    ) * instance.global_params.target_completion_penalty_weight
 
     fitness = (
         weights.makespan * makespan
@@ -1594,6 +1646,7 @@ def evaluate_decoded_solution(
         + weights.capacity_penalty * inventory_result.capacity_penalty
         + weights.load_penalty * load_penalty
         + weights.inventory_holding * inventory_result.average_inventory
+        + target_shortfall_penalty
     )
     return Evaluation(
         fitness=fitness,
@@ -1610,6 +1663,7 @@ def evaluate_decoded_solution(
         line_stop_time=inventory_result.line_stop_time,
         average_inventory=inventory_result.average_inventory,
         stop_penalty=stop_penalty,
+        target_shortfall_penalty=target_shortfall_penalty,
         inventory_result=inventory_result,
         agv_schedules=decoded.agv_schedules,
     )
@@ -1779,6 +1833,39 @@ def save_convergence_plot(history: Sequence[GAGenerationStats], output_path: str
     return output_path
 
 
+def build_history_figure(history: Sequence[GAGenerationStats]):
+    try:
+        from matplotlib.figure import Figure
+    except Exception:
+        return None
+
+    figure = Figure(figsize=(8, 6), dpi=100)
+    fitness_ax = figure.add_subplot(211)
+    makespan_ax = figure.add_subplot(212)
+
+    generations = [item.generation for item in history]
+    best_fitness = [item.best_fitness for item in history]
+    avg_fitness = [item.average_fitness for item in history]
+    best_makespan = [item.best_makespan for item in history]
+
+    fitness_ax.plot(generations, best_fitness, label="best_fitness", linewidth=2)
+    fitness_ax.plot(generations, avg_fitness, label="avg_fitness", linewidth=1.5, linestyle="--")
+    fitness_ax.set_title("适应度随代数变化")
+    fitness_ax.set_xlabel("代数")
+    fitness_ax.set_ylabel("适应度")
+    fitness_ax.grid(True, alpha=0.3)
+    fitness_ax.legend()
+
+    makespan_ax.plot(generations, best_makespan, color="tab:orange", linewidth=2)
+    makespan_ax.set_title("每代完成任务时间")
+    makespan_ax.set_xlabel("代数")
+    makespan_ax.set_ylabel("时间 / s")
+    makespan_ax.grid(True, alpha=0.3)
+
+    figure.tight_layout()
+    return figure
+
+
 def print_task_pool(tasks: Mapping[str, Task]) -> None:
     print("\n=== 当前任务池 ===")
     for task in tasks.values():
@@ -1818,7 +1905,7 @@ def print_schedule_summary(decoded: DecodedSolution) -> None:
             )
 
 
-def print_inventory_summary(evaluation: Evaluation) -> None:
+def print_inventory_summary(evaluation: Evaluation, target_qualified_units: float) -> None:
     result = evaluation.inventory_result
     print("\n=== 库存/停线结果 ===")
     pprint(
@@ -1829,7 +1916,7 @@ def print_inventory_summary(evaluation: Evaluation) -> None:
             "qualified_total": round(result.qualified_output_total, 2),
             "defect_total": round(result.defect_output_total, 2),
             "capacity_penalty": round(result.capacity_penalty, 4),
-            "target_qualified_reached": result.qualified_output_total >= 50.0,
+            "target_qualified_reached": result.qualified_output_total >= target_qualified_units,
         }
     )
 
@@ -1851,54 +1938,281 @@ def print_evaluation(title: str, evaluation: Evaluation) -> None:
             "load_penalty": round(evaluation.load_penalty, 2),
             "line_stop_time": round(evaluation.line_stop_time, 2),
             "average_inventory": round(evaluation.average_inventory, 2),
+            "target_shortfall_penalty": round(evaluation.target_shortfall_penalty, 2),
         }
     )
 
 
-def main() -> None:
-    instance = build_instance(seed=42)
+def run_experiment(
+    *,
+    generations: int = 40,
+    target_qualified_units: float = 50.0,
+    agv_count: int = 3,
+    population_size: int = 40,
+    seed: int = 42,
+) -> ExperimentRunResult:
+    instance = build_instance(
+        seed=seed,
+        agv_count=agv_count,
+        target_qualified_units=target_qualified_units,
+    )
     planning_levels = build_demo_planning_levels(instance)
     task_generator = TaskGenerator(instance)
     task_pool = task_generator.generate_tasks(current_time=0.0, levels=planning_levels)
     if not task_pool:
-        print("当前库存状态下未触发任务。")
-        return
-
-    print_task_pool(task_pool)
+        raise ValueError("当前库存状态下未触发任务。")
 
     manual_assignment = build_round_robin_assignment(list(task_pool.keys()), sorted(instance.agvs.keys()))
     decoded_manual = decode_assignment_map(manual_assignment, task_pool, instance)
     manual_evaluation = evaluate_decoded_solution(decoded_manual, task_pool, instance, planning_levels)
-    print_evaluation("人工轮转调度评价", manual_evaluation)
-    print_schedule_summary(decoded_manual)
-    print_inventory_summary(manual_evaluation)
 
     random_solution = build_random_solution(list(task_pool.keys()), random.Random(7))
     random_evaluation = evaluate_priority_solution(random_solution, task_pool, instance, planning_levels)
-    print_evaluation("随机优先级基线", random_evaluation)
 
     ga_result = solve_ga(
         task_pool,
         instance,
         planning_levels,
-        config=GAConfig(population_size=40, generations=40, heuristic_seed_count=8),
-        seed=42,
+        config=GAConfig(
+            population_size=population_size,
+            generations=generations,
+            heuristic_seed_count=min(8, population_size),
+        ),
+        seed=seed,
     )
     best_solution = ga_result.best_individual.solution
     best_evaluation = ga_result.best_individual.evaluation
     best_decoded = decode_solution(best_solution, task_pool, instance)
 
-    print_evaluation("GA 最优结果", best_evaluation)
-    print_schedule_summary(best_decoded)
-    print_inventory_summary(best_evaluation)
-    print("\n=== GA 收敛历史（前10/后10） ===")
-    history_values = [round(item.best_fitness, 2) for item in ga_result.history]
-    print("first_10:", history_values[:10])
-    print("last_10:", history_values[-10:])
+    return ExperimentRunResult(
+        instance=instance,
+        task_pool=task_pool,
+        planning_levels=planning_levels,
+        manual_decoded=decoded_manual,
+        manual_evaluation=manual_evaluation,
+        random_solution=random_solution,
+        random_evaluation=random_evaluation,
+        best_solution=best_solution,
+        best_decoded=best_decoded,
+        best_evaluation=best_evaluation,
+        ga_result=ga_result,
+    )
 
-    plot_path = save_convergence_plot(ga_result.history)
+
+def print_generation_history(history: Sequence[GAGenerationStats]) -> None:
+    print("\n=== 每代结果 ===")
+    print(f"{'gen':>4} {'best_fitness':>14} {'avg_fitness':>14} {'best_makespan':>14}")
+    for item in history:
+        print(
+            f"{item.generation:>4} "
+            f"{item.best_fitness:>14.2f} "
+            f"{item.average_fitness:>14.2f} "
+            f"{item.best_makespan:>14.2f}"
+        )
+
+
+def run_console_session() -> None:
+    def _read_int(prompt: str, default: int) -> int:
+        raw = input(f"{prompt} [{default}]: ").strip()
+        return int(raw) if raw else default
+
+    def _read_float(prompt: str, default: float) -> float:
+        raw = input(f"{prompt} [{default}]: ").strip()
+        return float(raw) if raw else default
+
+    generations = _read_int("请输入GA迭代次数", 40)
+    target_qualified_units = _read_float("请输入目标完成合格品数量", 50.0)
+    agv_count = _read_int("请输入AGV数量", 3)
+
+    result = run_experiment(
+        generations=generations,
+        target_qualified_units=target_qualified_units,
+        agv_count=agv_count,
+        population_size=max(20, min(100, agv_count * 15)),
+        seed=42,
+    )
+
+    print_task_pool(result.task_pool)
+    print_evaluation("人工轮转调度评价", result.manual_evaluation)
+    print_schedule_summary(result.manual_decoded)
+    print_inventory_summary(result.manual_evaluation, result.instance.global_params.target_qualified_units)
+    print_evaluation("随机优先级基线", result.random_evaluation)
+    print_evaluation("GA 最优结果", result.best_evaluation)
+    print_schedule_summary(result.best_decoded)
+    print_inventory_summary(result.best_evaluation, result.instance.global_params.target_qualified_units)
+    print_generation_history(result.ga_result.history)
+
+    plot_path = save_convergence_plot(result.ga_result.history)
     if plot_path is not None and Path(plot_path).exists():
         print(f"\n收敛曲线已保存: {plot_path}")
+
+
+def launch_gui() -> None:
+    if tk is None or ttk is None or ScrolledText is None:
+        raise RuntimeError("当前环境不支持 tkinter 图形界面。")
+
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
+    root = tk.Tk()
+    root.title("AGV 调度实验交互界面")
+    root.geometry("1400x900")
+
+    control_frame = ttk.LabelFrame(root, text="实验参数")
+    control_frame.pack(fill="x", padx=10, pady=10)
+
+    ttk.Label(control_frame, text="GA迭代次数").grid(row=0, column=0, padx=6, pady=6, sticky="w")
+    generations_var = tk.StringVar(value="40")
+    ttk.Entry(control_frame, textvariable=generations_var, width=12).grid(row=0, column=1, padx=6, pady=6)
+
+    ttk.Label(control_frame, text="目标合格品数量").grid(row=0, column=2, padx=6, pady=6, sticky="w")
+    target_var = tk.StringVar(value="50")
+    ttk.Entry(control_frame, textvariable=target_var, width=12).grid(row=0, column=3, padx=6, pady=6)
+
+    ttk.Label(control_frame, text="AGV数量").grid(row=0, column=4, padx=6, pady=6, sticky="w")
+    agv_var = tk.StringVar(value="3")
+    ttk.Entry(control_frame, textvariable=agv_var, width=12).grid(row=0, column=5, padx=6, pady=6)
+
+    ttk.Label(control_frame, text="种群规模").grid(row=0, column=6, padx=6, pady=6, sticky="w")
+    pop_var = tk.StringVar(value="40")
+    ttk.Entry(control_frame, textvariable=pop_var, width=12).grid(row=0, column=7, padx=6, pady=6)
+
+    notebook = ttk.Notebook(root)
+    notebook.pack(fill="both", expand=True, padx=10, pady=10)
+
+    summary_tab = ttk.Frame(notebook)
+    history_tab = ttk.Frame(notebook)
+    notebook.add(summary_tab, text="结果摘要")
+    notebook.add(history_tab, text="迭代过程")
+
+    summary_text = ScrolledText(summary_tab, wrap="word", font=("Courier New", 10))
+    summary_text.pack(fill="both", expand=True)
+
+    history_frame = ttk.Frame(history_tab)
+    history_frame.pack(fill="both", expand=True)
+
+    columns = ("generation", "best_fitness", "avg_fitness", "best_makespan", "best_line_stop")
+    history_tree = ttk.Treeview(history_frame, columns=columns, show="headings", height=18)
+    for column, title, width in [
+        ("generation", "代数", 80),
+        ("best_fitness", "最优适应度", 140),
+        ("avg_fitness", "平均适应度", 140),
+        ("best_makespan", "每代完成时间", 140),
+        ("best_line_stop", "停线时间", 120),
+    ]:
+        history_tree.heading(column, text=title)
+        history_tree.column(column, width=width, anchor="center")
+    history_tree.pack(side="left", fill="y", padx=(0, 10), pady=5)
+
+    chart_container = ttk.Frame(history_frame)
+    chart_container.pack(side="left", fill="both", expand=True)
+    canvas_holder: Dict[str, object] = {}
+
+    def append_summary(text: str) -> None:
+        summary_text.insert("end", text + "\n")
+        summary_text.see("end")
+
+    def run_from_ui() -> None:
+        try:
+            generations = int(generations_var.get())
+            target_qualified_units = float(target_var.get())
+            agv_count = int(agv_var.get())
+            population_size = int(pop_var.get())
+            if generations <= 0 or target_qualified_units <= 0 or agv_count <= 0 or population_size <= 1:
+                raise ValueError
+        except ValueError:
+            if messagebox is not None:
+                messagebox.showerror("参数错误", "请输入合法的正数参数。")
+            return
+
+        summary_text.delete("1.0", "end")
+        for item in history_tree.get_children():
+            history_tree.delete(item)
+        if "canvas" in canvas_holder:
+            canvas_holder["canvas"].get_tk_widget().destroy()
+            canvas_holder.clear()
+
+        try:
+            result = run_experiment(
+                generations=generations,
+                target_qualified_units=target_qualified_units,
+                agv_count=agv_count,
+                population_size=population_size,
+                seed=42,
+            )
+        except Exception as exc:
+            if messagebox is not None:
+                messagebox.showerror("运行失败", str(exc))
+            return
+
+        append_summary("=== 参数 ===")
+        append_summary(f"GA迭代次数: {generations}")
+        append_summary(f"目标合格品数量: {target_qualified_units}")
+        append_summary(f"AGV数量: {agv_count}")
+        append_summary(f"种群规模: {population_size}")
+        append_summary("")
+
+        append_summary("=== 当前任务池 ===")
+        for task in result.task_pool.values():
+            append_summary(
+                f"{task.task_id} | {task.task_type} | {task.pickup_node} -> {task.drop_node} | qty={task.qty} | latest={task.latest_finish:.2f}"
+            )
+        append_summary("")
+
+        append_summary("=== 结果对比 ===")
+        append_summary(
+            f"人工: fitness={result.manual_evaluation.fitness:.2f}, makespan={result.manual_evaluation.makespan:.2f}, line_stop={result.manual_evaluation.line_stop_time:.2f}"
+        )
+        append_summary(
+            f"随机: fitness={result.random_evaluation.fitness:.2f}, makespan={result.random_evaluation.makespan:.2f}, line_stop={result.random_evaluation.line_stop_time:.2f}"
+        )
+        append_summary(
+            f"GA最优: fitness={result.best_evaluation.fitness:.2f}, makespan={result.best_evaluation.makespan:.2f}, line_stop={result.best_evaluation.line_stop_time:.2f}"
+        )
+        append_summary(
+            f"目标合格品: {result.best_evaluation.inventory_result.qualified_output_total:.2f}/{result.instance.global_params.target_qualified_units:.2f}"
+        )
+        append_summary("")
+
+        append_summary("=== 最优AGV调度 ===")
+        for agv_id, schedule in result.best_decoded.agv_schedules.items():
+            append_summary(
+                f"{agv_id}: tasks={schedule.assigned_tasks}, final_time={schedule.final_time:.2f}, battery={schedule.final_battery:.4f}"
+            )
+
+        for item in result.ga_result.history:
+            history_tree.insert(
+                "",
+                "end",
+                values=(
+                    item.generation,
+                    f"{item.best_fitness:.2f}",
+                    f"{item.average_fitness:.2f}",
+                    f"{item.best_makespan:.2f}",
+                    f"{item.best_line_stop:.2f}",
+                ),
+            )
+
+        figure = build_history_figure(result.ga_result.history)
+        if figure is not None:
+            canvas = FigureCanvasTkAgg(figure, master=chart_container)
+            canvas.draw()
+            canvas.get_tk_widget().pack(fill="both", expand=True)
+            canvas_holder["canvas"] = canvas
+
+    ttk.Button(control_frame, text="运行实验", command=run_from_ui).grid(row=0, column=8, padx=12, pady=6)
+    ttk.Button(control_frame, text="退出", command=root.destroy).grid(row=0, column=9, padx=6, pady=6)
+
+    root.mainloop()
+
+
+def main() -> None:
+    if tk is not None and (os.environ.get("DISPLAY") or os.name == "nt"):
+        try:
+            launch_gui()
+            return
+        except Exception:
+            pass
+    run_console_session()
 
 
 if __name__ == "__main__":
