@@ -190,6 +190,8 @@ class SimulationResult:
     charge_count: int
     completed_tasks: int
     line_blocked_minutes: float
+    total_task_wait: float
+    max_task_wait: float
     pending_tasks: int
     fitness: float
 
@@ -198,8 +200,12 @@ class SimulationResult:
 class GenerationRecord:
     generation: int
     fitness: float
+    avg_fitness: float
+    worst_fitness: float
     completion_time: float
     good_stock: int
+    total_task_wait: float
+    line_blocked_minutes: float
 
 
 class WorkshopSimulator:
@@ -225,6 +231,8 @@ class WorkshopSimulator:
         self.completed_tasks = 0
         self.total_energy_kwh = 0.0
         self.inspected_count = 0
+        self.total_task_wait = 0.0
+        self.max_task_wait = 0.0
 
         self.raw_storage = self._init_raw_storage()
         self.finished_storage = self._init_finished_storage()
@@ -740,6 +748,10 @@ class WorkshopSimulator:
         return True
 
     def _schedule_task(self, agv: AGV, task: Task) -> Tuple[float, float, float]:
+        task_wait = max(0.0, self.time - task.created_at)
+        self.total_task_wait += task_wait
+        self.max_task_wait = max(self.max_task_wait, task_wait)
+
         task_distance = manhattan(agv.pos, task.pickup) + manhattan(task.pickup, task.drop)
         task_energy = task_distance * ENERGY_KWH_PER_M
         elapsed = 0.0
@@ -832,9 +844,10 @@ class WorkshopSimulator:
         if reached:
             fitness = (
                 completion_time
-                + 0.002 * total_distance
-                + 0.20 * blocked
-                + 0.50 * charge_count
+                + 0.010 * total_distance
+                + 0.80 * blocked
+                + 0.50 * self.total_task_wait
+                + 2.00 * charge_count
             )
         else:
             shortage = self.target_good - self.good_stock
@@ -842,8 +855,10 @@ class WorkshopSimulator:
                 self.max_time_min
                 + 10000.0
                 + 50.0 * shortage
-                + 0.20 * blocked
-                + 0.002 * total_distance
+                + 0.80 * blocked
+                + 0.50 * self.total_task_wait
+                + 0.010 * total_distance
+                + 2.00 * charge_count
             )
 
         return SimulationResult(
@@ -856,6 +871,8 @@ class WorkshopSimulator:
             charge_count=charge_count,
             completed_tasks=self.completed_tasks,
             line_blocked_minutes=blocked,
+            total_task_wait=self.total_task_wait,
+            max_task_wait=self.max_task_wait,
             pending_tasks=len(self.pending),
             fitness=fitness,
         )
@@ -968,6 +985,8 @@ def run_ga(
 
         evaluated.sort(key=lambda item: item[0])
         generation_best_fitness, generation_best_genes, generation_best_result = evaluated[0]
+        generation_worst_fitness = evaluated[-1][0]
+        generation_avg_fitness = sum(item[0] for item in evaluated) / len(evaluated)
 
         if best_result is None or generation_best_fitness < best_result.fitness:
             best_genes = copy.deepcopy(generation_best_genes)
@@ -976,8 +995,12 @@ def run_ga(
         record = GenerationRecord(
             generation=generation,
             fitness=generation_best_fitness,
+            avg_fitness=generation_avg_fitness,
+            worst_fitness=generation_worst_fitness,
             completion_time=generation_best_result.completion_time,
             good_stock=generation_best_result.good_stock,
+            total_task_wait=generation_best_result.total_task_wait,
+            line_blocked_minutes=generation_best_result.line_blocked_minutes,
         )
         history.append(record)
         if progress_callback is not None:
@@ -986,10 +1009,13 @@ def run_ga(
         if args.verbose or generation == 1 or generation == args.generations:
             print(
                 f"Generation {generation:03d} | "
-                f"best fitness={generation_best_fitness:.2f} | "
+                f"best={generation_best_fitness:.2f} | "
+                f"avg={generation_avg_fitness:.2f} | "
+                f"worst={generation_worst_fitness:.2f} | "
                 f"time={generation_best_result.completion_time:.2f} min | "
                 f"good={generation_best_result.good_stock} | "
-                f"blocked={generation_best_result.line_blocked_minutes:.2f} min"
+                f"blocked={generation_best_result.line_blocked_minutes:.2f} min | "
+                f"wait={generation_best_result.total_task_wait:.2f} min"
             )
 
         elite_count = max(1, int(args.population * 0.15))
@@ -1068,6 +1094,8 @@ def print_report(genes: Dict[str, float], result: SimulationResult) -> None:
     print(f"Total AGV energy     : {result.total_energy:.2f} kWh")
     print(f"Charging count       : {result.charge_count}")
     print(f"Line blocked time    : {result.line_blocked_minutes:.2f} station-min")
+    print(f"Total task wait      : {result.total_task_wait:.2f} min")
+    print(f"Max task wait        : {result.max_task_wait:.2f} min")
     print(f"Pending tasks        : {result.pending_tasks}")
     print(f"Fitness              : {result.fitness:.2f}")
 
@@ -1084,6 +1112,8 @@ def format_result_text(genes: Dict[str, float], result: SimulationResult) -> str
         f"Total AGV energy     : {result.total_energy:.2f} kWh",
         f"Charging count       : {result.charge_count}",
         f"Line blocked time    : {result.line_blocked_minutes:.2f} station-min",
+        f"Total task wait      : {result.total_task_wait:.2f} min",
+        f"Max task wait        : {result.max_task_wait:.2f} min",
         f"Pending tasks        : {result.pending_tasks}",
         f"Fitness              : {result.fitness:.2f}",
         "",
@@ -1147,14 +1177,27 @@ def launch_ui(default_args: argparse.Namespace) -> None:
 
     table_frame = ttk.LabelFrame(root, text="每代结果")
     table_frame.pack(fill="both", expand=True, padx=10, pady=8)
-    columns = ("generation", "fitness", "completion_time", "good_stock")
+    columns = (
+        "generation",
+        "best_fitness",
+        "avg_fitness",
+        "worst_fitness",
+        "completion_time",
+        "good_stock",
+        "task_wait",
+        "blocked",
+    )
     tree = ttk.Treeview(table_frame, columns=columns, show="headings", height=8)
     tree.heading("generation", text="代数")
-    tree.heading("fitness", text="适应度")
+    tree.heading("best_fitness", text="最优适应度")
+    tree.heading("avg_fitness", text="平均适应度")
+    tree.heading("worst_fitness", text="最差适应度")
     tree.heading("completion_time", text="完成时间/min")
     tree.heading("good_stock", text="合格品数量")
+    tree.heading("task_wait", text="任务等待/min")
+    tree.heading("blocked", text="停线/min")
     for column in columns:
-        tree.column(column, anchor="center", width=140)
+        tree.column(column, anchor="center", width=120)
     tree.pack(side="left", fill="both", expand=True)
     tree_scroll = ttk.Scrollbar(table_frame, orient="vertical", command=tree.yview)
     tree_scroll.pack(side="right", fill="y")
@@ -1232,13 +1275,18 @@ def launch_ui(default_args: argparse.Namespace) -> None:
             values=(
                 record.generation,
                 f"{record.fitness:.2f}",
+                f"{record.avg_fitness:.2f}",
+                f"{record.worst_fitness:.2f}",
                 f"{record.completion_time:.2f}",
                 record.good_stock,
+                f"{record.total_task_wait:.2f}",
+                f"{record.line_blocked_minutes:.2f}",
             ),
         )
         tree.yview_moveto(1.0)
         status_var.set(
-            f"第 {record.generation} 代 | 适应度 {record.fitness:.2f} | "
+            f"第 {record.generation} 代 | best {record.fitness:.2f} | "
+            f"avg {record.avg_fitness:.2f} | worst {record.worst_fitness:.2f} | "
             f"完成时间 {record.completion_time:.2f} min | 合格品 {record.good_stock}"
         )
         draw_fitness(history)
